@@ -1,0 +1,36 @@
+From 154c8d5bbdc8a002116262690ef43e810a5eb7eb Mon Sep 17 00:00:00 2001
+From: Felipe Borges <felipeborges@gnome.org>
+Date: Mon, 8 Aug 2016 16:14:06 +0200
+Subject: [PATCH] Allow the launch of multiple application instances
+
+We advertize the --new-window application option but since the
+port to GtkApplication we are requesting for a unique application
+ID, which prevents the launch of new instances.
+
+The G_APPLICATION_NON_UNIQUE gapplication flag allows the launching
+of new vinagre instances by not attempting to do any of the typical
+single-instance application negotiation, even if the application
+ID is given. The application neither attempts to become the owner
+of the application ID nor does it check if an existing owner already
+exists. Everything occurs in the local process.
+
+https://bugzilla.gnome.org/show_bug.cgi?id=769631
+---
+ vinagre/vinagre-main.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/vinagre/vinagre-main.c b/vinagre/vinagre-main.c
+index 9e66b72..91eba77 100644
+--- a/vinagre/vinagre-main.c
++++ b/vinagre/vinagre-main.c
+@@ -182,7 +182,7 @@ int main (int argc, char **argv) {
+   g_set_application_name (_("Remote Desktop Viewer"));
+   optionstate.new_window = FALSE;
+ 
+-  app = gtk_application_new ("org.gnome.vinagre", G_APPLICATION_HANDLES_COMMAND_LINE);
++  app = gtk_application_new ("org.gnome.vinagre", G_APPLICATION_HANDLES_COMMAND_LINE | G_APPLICATION_NON_UNIQUE);
+   /* https://bugzilla.gnome.org/show_bug.cgi?id=634990 */
+   /* g_application_set_option_context (G_APPLICATION (app), context); */
+   g_signal_connect (app,
+-- 
+2.7.4

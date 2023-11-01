@@ -1,0 +1,62 @@
+--- vinagre-3.22.0/plugins/rdp/vinagre-rdp-tab.c
++++ vinagre-3.22.0/plugins/rdp/vinagre-rdp-tab.c
+@@ -663,7 +663,7 @@ update (gpointer user_data)
+                         wfds, &wcount))
+     {
+       g_warning ("Failed to get FreeRDP file descriptor\n");
+-      return FALSE;
++      goto remove;
+     }
+ 
+   max_fds = 0;
+@@ -681,7 +681,7 @@ update (gpointer user_data)
+     }
+ 
+   if (max_fds == 0)
+-    return FALSE;
++    goto remove;
+ 
+   timeout.tv_sec = 0;
+   timeout.tv_usec = SELECT_TIMEOUT;
+@@ -696,14 +696,21 @@ update (gpointer user_data)
+             (errno == EINTR))) /* signal occurred */
+       {
+         g_warning ("update: select failed\n");
+-        return FALSE;
++        goto remove;
+       }
+     }
+ 
+   if (!freerdp_check_fds (priv->freerdp_session))
+     {
+-      g_warning ("Failed to check FreeRDP file descriptor\n");
+-      return FALSE;
++      if (freerdp_shall_disconnect (priv->freerdp_session))
++        g_idle_add ((GSourceFunc) idle_close, rdp_tab);
++
++#ifdef HAVE_FREERDP_1_2
++      if (freerdp_get_last_error (priv->freerdp_session->context) != FREERDP_ERROR_LOGOFF_BY_USER)
++#endif
++        g_warning ("Failed to check FreeRDP file descriptor\n");
++
++      goto remove;
+     }
+ 
+   frdp_process_events (priv->freerdp_session, priv->events);
+@@ -711,10 +718,14 @@ update (gpointer user_data)
+   if (freerdp_shall_disconnect (priv->freerdp_session))
+     {
+       g_idle_add ((GSourceFunc) idle_close, rdp_tab);
+-      return FALSE;
++      goto remove;
+     }
+ 
+-  return TRUE;
++  return G_SOURCE_CONTINUE;
++
++remove:
++  rdp_tab->priv->update_id = 0;
++  return G_SOURCE_REMOVE;
+ }
+ 
+ static gboolean
