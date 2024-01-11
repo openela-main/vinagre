@@ -1,0 +1,86 @@
+diff --git a/plugins/rdp/vinagre-rdp-tab.c b/plugins/rdp/vinagre-rdp-tab.c
+index b446c01..95740ff 100644
+--- a/plugins/rdp/vinagre-rdp-tab.c
++++ b/plugins/rdp/vinagre-rdp-tab.c
+@@ -76,7 +76,7 @@ struct _VinagreRdpTabPrivate
+ 
+ G_DEFINE_TYPE (VinagreRdpTab, vinagre_rdp_tab, VINAGRE_TYPE_TAB)
+ 
+-static void open_freerdp (VinagreRdpTab *rdp_tab);
++static gboolean open_freerdp (VinagreRdpTab *rdp_tab);
+ static void setup_toolbar (VinagreRdpTab *rdp_tab);
+ static void vinagre_rdp_tab_set_scaling (VinagreRdpTab *tab,
+                                          gboolean       scaling);
+@@ -248,9 +248,8 @@ vinagre_rdp_tab_constructed (GObject *object)
+     G_OBJECT_CLASS (vinagre_rdp_tab_parent_class)->constructed (object);
+ 
+   setup_toolbar (rdp_tab);
+-  open_freerdp (rdp_tab);
+-
+-  g_idle_add ((GSourceFunc) emit_delayed_signal, object);
++  if (open_freerdp (rdp_tab))
++    g_idle_add ((GSourceFunc) emit_delayed_signal, object);
+ }
+ 
+ static void
+@@ -947,8 +946,6 @@ frdp_authenticate (freerdp  *instance,
+     }
+   else
+     {
+-      vinagre_tab_remove_from_notebook (tab);
+-
+       return FALSE;
+     }
+ 
+@@ -1239,7 +1236,7 @@ init_display (VinagreRdpTab *rdp_tab)
+                                                    rdp_tab);
+ }
+ 
+-static void
++static gboolean
+ open_freerdp (VinagreRdpTab *rdp_tab)
+ {
+   VinagreRdpTabPrivate *priv = rdp_tab->priv;
+@@ -1248,6 +1245,7 @@ open_freerdp (VinagreRdpTab *rdp_tab)
+   gboolean              success = TRUE;
+   gboolean              cancelled = FALSE;
+   guint                 authentication_errors = 0;
++  gboolean              result = FALSE;
+ 
+   priv->events = g_queue_new ();
+ 
+@@ -1260,10 +1258,11 @@ open_freerdp (VinagreRdpTab *rdp_tab)
+       success = freerdp_connect (priv->freerdp_session);
+       if (!success)
+         {
+-          authentication_errors += freerdp_get_last_error (priv->freerdp_session->context) == 0x20009 ||
+-                                   freerdp_get_last_error (priv->freerdp_session->context) == 0x2000c;
++          authentication_errors += freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_AUTHENTICATION_FAILED ||
++                                   freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_SECURITY_NEGO_CONNECT_FAILED;
+ 
+-          cancelled = freerdp_get_last_error (priv->freerdp_session->context) == 0x2000b;
++          cancelled = freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_CONNECT_NO_OR_MISSING_CREDENTIALS ||
++                      freerdp_get_last_error (priv->freerdp_session->context) == FREERDP_ERROR_CONNECT_CANCELLED;
+ 
+           freerdp_free (priv->freerdp_session);
+           init_freerdp (rdp_tab);
+@@ -1244,7 +1243,7 @@ open_freerdp (VinagreRdpTab *rdp_tab)
+           init_freerdp (rdp_tab);
+         }
+     }
+-  while (!success && authentication_errors < 3);
++  while (!success && authentication_errors < 3 && !cancelled);
+ 
+   if (!success)
+     {
+@@ -1284,7 +1283,10 @@ open_freerdp (VinagreRdpTab *rdp_tab)
+     {
+       priv->authentication_attempts = 0;
+       priv->update_id = g_timeout_add (5, (GSourceFunc) update, rdp_tab);
++      result = TRUE;
+     }
++
++  return result;
+ }
+ 
+ static void
