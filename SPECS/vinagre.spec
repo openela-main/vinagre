@@ -4,7 +4,7 @@
 
 Name:           vinagre
 Version:        3.22.0
-Release:        23%{?dist}
+Release:        24%{?dist}
 Summary:        VNC client for GNOME
 
 Group:          Applications/System
@@ -44,6 +44,9 @@ Patch9:         vinagre-3-22.0-allow-multiple-windows.patch
 
 # https://bugzilla.redhat.com/show_bug.cgi?id=1839744
 Patch10:        vinagre-3.22.0-rdp-black-screen.patch
+
+# https://issues.redhat.com/browse/RHEL-57691
+Patch11:        vinagre-3.22.0-rdp-graphics-pipeline.patch
 
 %if 0%{?with_spice}
 BuildRequires:  pkgconfig(spice-client-gtk-3.0)
@@ -104,6 +107,7 @@ Apart from the VNC protocol, vinagre supports Spice and RDP.
 %patch8 -p1
 %patch9 -p1
 %patch10 -p1
+%patch11 -p1
 
 
 %build
@@ -151,6 +155,10 @@ make check
 
 
 %changelog
+* Fri Nov 22 2024 Marek Kasik <mkasik@redhat.com> - 3.22.0-24
+- Enable Graphics Pipeline for RDP connections
+- Resolves: RHEL-57691
+
 * Fri Jun  5 2020 Marek Kasik <mkasik@redhat.com> - 3.22.0-23
 - Remove unused variable (CovScan)
 - Related: #1839744

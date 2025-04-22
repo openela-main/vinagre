@@ -1,0 +1,521 @@
+--- vinagre-3.22.0/plugins/rdp/vinagre-rdp-tab.c
++++ vinagre-3.22.0/plugins/rdp/vinagre-rdp-tab.c
+@@ -35,6 +35,11 @@
+ #include <freerdp/kbd/vkcodes.h>
+ #include <gdk/gdkx.h>
+ #endif
++#include <freerdp/gdi/gfx.h>
++#include <freerdp/gdi/video.h>
++#include <freerdp/client/channels.h>
++#include <freerdp/client/cmdline.h>
++#include <freerdp/channels/disp.h>
+ 
+ #include "vinagre-rdp-tab.h"
+ #include "vinagre-rdp-connection.h"
+@@ -42,7 +47,7 @@
+ 
+ #define VINAGRE_RDP_TAB_GET_PRIVATE(object)(G_TYPE_INSTANCE_GET_PRIVATE ((object), VINAGRE_TYPE_RDP_TAB, VinagreRdpTabPrivate))
+ 
+-#define SELECT_TIMEOUT 50
++#define SELECT_TIMEOUT 10
+ 
+ #ifndef HAVE_FREERDP_1_1
+ typedef boolean BOOL;
+@@ -72,6 +77,9 @@ struct _VinagreRdpTabPrivate
+   double           offset_x, offset_y;
+ 
+   guint            authentication_attempts;
++
++  GQueue          *area_draw_queue;  /* elem: GdkRectangle */
++  GMutex           area_draw_mutex;
+ };
+ 
+ G_DEFINE_TYPE (VinagreRdpTab, vinagre_rdp_tab, VINAGRE_TYPE_TAB)
+@@ -192,6 +200,12 @@ vinagre_rdp_tab_dispose (GObject *object
+       g_clear_pointer (&priv->events, g_queue_free);
+     }
+ 
++  g_mutex_lock (&priv->area_draw_mutex);
++  g_queue_free_full (priv->area_draw_queue, g_free);
++  priv->area_draw_queue = NULL;
++  g_mutex_unlock (&priv->area_draw_mutex);
++  g_mutex_clear (&priv->area_draw_mutex);
++
+   if (priv->update_id > 0)
+     {
+       g_source_remove (rdp_tab->priv->update_id);
+@@ -372,6 +385,51 @@ setup_toolbar (VinagreRdpTab *rdp_tab)
+ }
+ 
+ static void
++frdp_on_channel_connected_event_handler (void                      *context,
++                                         ChannelConnectedEventArgs *e)
++{
++  frdpContext *ctx = (frdpContext *) context;
++
++  if (g_strcmp0 (e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
++    gdi_graphics_pipeline_init (ctx->context.gdi, (RdpgfxClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_geometry_init (ctx->context.gdi, (GeometryClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, VIDEO_CONTROL_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_control_init (ctx->context.gdi, (VideoClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, VIDEO_DATA_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_data_init (ctx->context.gdi, (VideoClientContext *) e->pInterface);
++  }
++}
++
++static void
++frdp_on_channel_disconnected_event_handler (void                         *context,
++                                            ChannelDisconnectedEventArgs *e)
++{
++  frdpContext *ctx = (frdpContext *) context;
++
++  if (g_strcmp0 (e->name, RDPGFX_DVC_CHANNEL_NAME) == 0) {
++    gdi_graphics_pipeline_uninit (ctx->context.gdi, (RdpgfxClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, GEOMETRY_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_geometry_uninit (ctx->context.gdi, (GeometryClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, VIDEO_CONTROL_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_control_uninit (ctx->context.gdi, (VideoClientContext *) e->pInterface);
++  } else if (g_strcmp0 (e->name, VIDEO_DATA_DVC_CHANNEL_NAME) == 0) {
++    gdi_video_data_uninit (ctx->context.gdi, (VideoClientContext *) e->pInterface);
++  }
++}
++
++static gboolean
++frdp_load_channels (VinagreRdpTab *rdp_tab)
++{
++  VinagreRdpTabPrivate *priv = rdp_tab->priv;
++
++  if (!freerdp_client_load_addins (priv->freerdp_session->context->channels, priv->freerdp_session->context->settings))
++    return FALSE;
++
++  return TRUE;
++}
++
++static void
+ frdp_process_events (freerdp *instance,
+                      GQueue  *events)
+ {
+@@ -424,6 +482,34 @@ frdp_process_events (freerdp *instance,
+     }
+ }
+ 
++static void
++create_cairo_surface (VinagreRdpTab *rdp_tab)
++{
++  VinagreRdpTabPrivate *priv = rdp_tab->priv;
++  rdpGdi               *gdi;
++  gint                  stride;
++
++  if (priv->surface != NULL) {
++    cairo_surface_mark_dirty (priv->surface);
++    cairo_surface_destroy (priv->surface);
++    priv->surface = NULL;
++  }
++
++  gdi = priv->freerdp_session->context->gdi;
++
++  gtk_widget_set_size_request (priv->display,
++                               gdi->width,
++                               gdi->height);
++  stride = cairo_format_stride_for_width (CAIRO_FORMAT_RGB24, gdi->width);
++  priv->surface =
++      cairo_image_surface_create_for_data ((unsigned char*) gdi->primary_buffer,
++                                           CAIRO_FORMAT_RGB24,
++                                           gdi->width,
++                                           gdi->height,
++                                           stride);
++  cairo_surface_flush (priv->surface);
++}
++
+ static gboolean
+ frdp_drawing_area_draw (GtkWidget *area,
+                         cairo_t   *cr,
+@@ -431,13 +517,17 @@ frdp_drawing_area_draw (GtkWidget *area,
+ {
+   VinagreRdpTab        *rdp_tab = (VinagreRdpTab *) user_data;
+   VinagreRdpTabPrivate *priv = rdp_tab->priv;
+-  VinagreRdpConnection *conn = VINAGRE_RDP_CONNECTION (vinagre_tab_get_conn (VINAGRE_TAB (rdp_tab)));
++  rdpSettings          *settings;
+   GtkWidget            *scrolled;
+-  double                scale_x, scale_y;
++  double                widget_ratio, server_ratio;
+   gint                  window_width, window_height;
+ 
+-  if (priv->surface == NULL)
+-    return FALSE;
++  settings = priv->freerdp_session->context->settings;
++
++  if (priv->surface == NULL ||
++      (priv->freerdp_session->context->gdi->width != cairo_image_surface_get_width (priv->surface) ||
++       priv->freerdp_session->context->gdi->height != cairo_image_surface_get_height (priv->surface)))
++    create_cairo_surface (rdp_tab);
+ 
+   if (priv->scaling)
+     {
+@@ -445,13 +535,16 @@ frdp_drawing_area_draw (GtkWidget *area,
+       window_width = gtk_widget_get_allocated_width (scrolled);
+       window_height = gtk_widget_get_allocated_height (scrolled);
+ 
+-      scale_x = (double) window_width / vinagre_connection_get_width (VINAGRE_CONNECTION (conn));
+-      scale_y = (double) window_height / vinagre_connection_get_height (VINAGRE_CONNECTION (conn));
++      widget_ratio = window_height > 0 ? (double) window_width / window_height : 1.0;
++      server_ratio = settings->DesktopHeight > 0 ? (double) settings->DesktopWidth / settings->DesktopHeight : 1.0;
+ 
+-      priv->scale = scale_x < scale_y ? scale_x : scale_y;
++      if (widget_ratio > server_ratio)
++        priv->scale = (double) window_height / settings->DesktopHeight;
++      else
++        priv->scale = (double) window_width / settings->DesktopWidth;
+ 
+-      priv->offset_x = (window_width - vinagre_connection_get_width (VINAGRE_CONNECTION (conn)) * priv->scale) / 2.0;
+-      priv->offset_y = (window_height - vinagre_connection_get_height (VINAGRE_CONNECTION (conn)) * priv->scale) / 2.0;
++      priv->offset_x = (window_width - settings->DesktopWidth * priv->scale) / 2.0;
++      priv->offset_y = (window_height - settings->DesktopHeight * priv->scale) / 2.0;
+ 
+       if (priv->offset_x < 0)
+         priv->offset_x = 0;
+@@ -468,6 +561,12 @@ frdp_drawing_area_draw (GtkWidget *area,
+                                      window_width,
+                                      window_height);
+     }
++  else
++    {
++      gtk_widget_set_size_request (area,
++                                   settings->DesktopWidth,
++                                   settings->DesktopHeight);
++    }
+ 
+   cairo_set_source_surface (cr, priv->surface, 0, 0);
+   cairo_paint (cr);
+@@ -492,6 +591,30 @@ frdp_begin_paint (rdpContext *context)
+ #endif
+ }
+ 
++static void
++queue_draw_area (VinagreRdpTab *rdp_tab,
++                 gint           x,
++                 gint           y,
++                 gint           width,
++                 gint           height)
++{
++  VinagreRdpTabPrivate *priv = rdp_tab->priv;
++  GdkRectangle         *rectangle;
++
++  rectangle = g_new (GdkRectangle, 1);
++  rectangle->x = x;
++  rectangle->y = y;
++  rectangle->width = width;
++  rectangle->height = height;
++
++  g_mutex_lock (&priv->area_draw_mutex);
++
++  if (priv->area_draw_queue != NULL)
++    g_queue_push_tail (priv->area_draw_queue, rectangle);
++
++  g_mutex_unlock (&priv->area_draw_mutex);
++}
++
+ #ifdef HAVE_FREERDP_2
+ static BOOL
+ #else
+@@ -524,15 +647,15 @@ frdp_end_paint (rdpContext *context)
+       pos_x = priv->offset_x + x * priv->scale;
+       pos_y = priv->offset_y + y * priv->scale;
+ 
+-      gtk_widget_queue_draw_area (priv->display,
+-                                  floor (pos_x),
+-                                  floor (pos_y),
+-                                  ceil (pos_x + w * priv->scale) - floor (pos_x),
+-                                  ceil (pos_y + h * priv->scale) - floor (pos_y));
++      queue_draw_area (rdp_tab,
++                       floor (pos_x),
++                       floor (pos_y),
++                       ceil (pos_x + w * priv->scale) - floor (pos_x),
++                       ceil (pos_y + h * priv->scale) - floor (pos_y));
+     }
+   else
+     {
+-      gtk_widget_queue_draw_area (priv->display, x, y, w, h);
++      queue_draw_area (rdp_tab, x, y, w, h);
+     }
+ 
+ #ifdef HAVE_FREERDP_2
+@@ -540,9 +663,32 @@ frdp_end_paint (rdpContext *context)
+ #endif
+ }
+ 
++static gboolean
++frdp_desktop_resize (rdpContext *context)
++{
++  VinagreRdpTab *rdp_tab = ((frdpContext *) context)->rdp_tab;
++  rdpGdi        *gdi = context->gdi;
++
++  if (gdi_resize (gdi,
++                  context->settings->DesktopWidth,
++                  context->settings->DesktopHeight)) {
++    /*
++     * Do not resize cairo surface here as this can be called from a thread other than #1!
++     * Test for different sizes in draw() method seems sufficient.
++     */
++    return TRUE;
++  } else {
++    return FALSE;
++  }
++}
++
+ static BOOL
+ frdp_pre_connect (freerdp *instance)
+ {
++  rdpContext    *context = instance->context;
++  frdpContext   *ctx = (frdpContext *) context;
++  VinagreRdpTab *rdp_tab = ctx->rdp_tab;
++
+ #ifndef HAVE_FREERDP_1_1
+   rdpSettings *settings = instance->settings;
+ 
+@@ -570,8 +716,16 @@ frdp_pre_connect (freerdp *instance)
+   settings->order_support[NEG_POLYGON_CB_INDEX] = false;
+   settings->order_support[NEG_ELLIPSE_SC_INDEX] = false;
+   settings->order_support[NEG_ELLIPSE_CB_INDEX] = false;
++
+ #endif
+ 
++  PubSub_SubscribeChannelConnected (context->pubSub,
++                                    frdp_on_channel_connected_event_handler);
++  PubSub_SubscribeChannelDisconnected (context->pubSub,
++                                       frdp_on_channel_disconnected_event_handler);
++
++  frdp_load_channels (rdp_tab);
++
+   return TRUE;
+ }
+ 
+@@ -595,6 +749,7 @@ frdp_post_connect (freerdp *instance)
+ 
+   instance->update->BeginPaint = frdp_begin_paint;
+   instance->update->EndPaint = frdp_end_paint;
++  instance->update->DesktopResize = frdp_desktop_resize;
+ 
+   stride = cairo_format_stride_for_width (CAIRO_FORMAT_RGB24, gdi->width);
+   rdp_tab->priv->surface = cairo_image_surface_create_for_data ((unsigned char*) gdi->primary_buffer,
+@@ -613,94 +768,76 @@ frdp_post_connect (freerdp *instance)
+   return TRUE;
+ }
+ 
++static void
++frdp_post_disconnect (freerdp *instance)
++{
++  rdpContext *context;
++
++  if (!instance || !instance->context)
++    return;
++
++  context = instance->context;
++  PubSub_UnsubscribeChannelConnected (context->pubSub,
++                                      frdp_on_channel_connected_event_handler);
++  PubSub_UnsubscribeChannelDisconnected (context->pubSub,
++                                         frdp_on_channel_disconnected_event_handler);
++  gdi_free (instance);
++}
++
+ static gboolean
+ update (gpointer user_data)
+ {
+   VinagreRdpTab        *rdp_tab = (VinagreRdpTab *) user_data;
+   VinagreRdpTabPrivate *priv = rdp_tab->priv;
+-  struct timeval        timeout;
+-  fd_set                rfds_set;
+-  fd_set                wfds_set;
+-  void                 *rfds[32];
+-  void                 *wfds[32];
+-  int                   i;
+-  int                   fds;
+-  int                   max_fds;
+-  int                   rcount = 0;
+-  int                   wcount = 0;
+-  int                   result;
+-
+-  memset (rfds, 0, sizeof (rfds));
+-  memset (wfds, 0, sizeof (wfds));
+-
+-  if (!freerdp_get_fds (priv->freerdp_session,
+-                        rfds, &rcount,
+-                        wfds, &wcount))
+-    {
+-      g_warning ("Failed to get FreeRDP file descriptor\n");
+-      goto remove;
+-    }
++  HANDLE                handles[64];
++  DWORD                 status;
++  DWORD                 usedHandles;
++  GdkRectangle         *rectangle;
++
++  g_mutex_lock (&priv->area_draw_mutex);
++
++  while (priv->area_draw_queue != NULL && !g_queue_is_empty (priv->area_draw_queue)) {
++      rectangle = g_queue_pop_head (priv->area_draw_queue);
++      gtk_widget_queue_draw_area (priv->display, rectangle->x, rectangle->y, rectangle->width, rectangle->height);
++      g_free (rectangle);
++  }
+ 
+-  max_fds = 0;
+-  FD_ZERO (&rfds_set);
+-  FD_ZERO (&wfds_set);
++  g_mutex_unlock (&priv->area_draw_mutex);
+ 
+-  for (i = 0; i < rcount; i++)
+-    {
+-      fds = (int)(long) (rfds[i]);
+-
+-      if (fds > max_fds)
+-        max_fds = fds;
+-
+-      FD_SET (fds, &rfds_set);
+-    }
+-
+-  if (max_fds == 0)
+-    goto remove;
+-
+-  timeout.tv_sec = 0;
+-  timeout.tv_usec = SELECT_TIMEOUT;
+-
+-  result = select (max_fds + 1, &rfds_set, NULL, NULL, &timeout);
+-  if (result == -1)
+-    {
+-      /* these are not errors */
+-      if (!((errno == EAGAIN) ||
+-            (errno == EWOULDBLOCK) ||
+-            (errno == EINPROGRESS) ||
+-            (errno == EINTR))) /* signal occurred */
+-      {
+-        g_warning ("update: select failed\n");
+-        goto remove;
+-      }
+-    }
++  if (freerdp_shall_disconnect (priv->freerdp_session)) {
++      priv->update_id = 0;
++      g_idle_add ((GSourceFunc) idle_close, rdp_tab);
+ 
+-  if (!freerdp_check_fds (priv->freerdp_session))
+-    {
+-      if (freerdp_shall_disconnect (priv->freerdp_session))
+-        g_idle_add ((GSourceFunc) idle_close, rdp_tab);
++      return FALSE;
++  }
+ 
+-#ifdef HAVE_FREERDP_1_2
+-      if (freerdp_get_last_error (priv->freerdp_session->context) != FREERDP_ERROR_LOGOFF_BY_USER)
+-#endif
+-        g_warning ("Failed to check FreeRDP file descriptor\n");
++  usedHandles = freerdp_get_event_handles (priv->freerdp_session->context,
++                                           handles, ARRAYSIZE(handles));
++  if (usedHandles == 0) {
++      g_warning ("Failed to get FreeRDP event handle");
++      priv->update_id = 0;
++      return FALSE;
++  }
+ 
+-      goto remove;
+-    }
++  status = WaitForMultipleObjects (usedHandles, handles, FALSE, SELECT_TIMEOUT);
++  if (status == WAIT_TIMEOUT)
++    return TRUE;
++  if (status == WAIT_FAILED) {
++    priv->update_id = 0;
++    return FALSE;
++  }
+ 
+   frdp_process_events (priv->freerdp_session, priv->events);
+ 
+-  if (freerdp_shall_disconnect (priv->freerdp_session))
+-    {
+-      g_idle_add ((GSourceFunc) idle_close, rdp_tab);
+-      goto remove;
++  if (!freerdp_check_event_handles (priv->freerdp_session->context)) {
++    if (freerdp_get_last_error(priv->freerdp_session->context) == FREERDP_ERROR_SUCCESS) {
++      g_warning ("Failed to check FreeRDP file descriptor");
+     }
+ 
+-  return G_SOURCE_CONTINUE;
++    return TRUE;
++  }
+ 
+-remove:
+-  rdp_tab->priv->update_id = 0;
+-  return G_SOURCE_REMOVE;
++  return TRUE;
+ }
+ 
+ static gboolean
+@@ -1070,6 +1207,7 @@ init_freerdp (VinagreRdpTab *rdp_tab)
+   VinagreConnection    *conn = vinagre_tab_get_conn (tab);
+   gboolean              scaling;
+   gchar                *hostname;
++  gchar                *build_options;
+   gint                  width, height;
+   gint                  port;
+ 
+@@ -1085,6 +1223,7 @@ init_freerdp (VinagreRdpTab *rdp_tab)
+   priv->freerdp_session = freerdp_new ();
+   priv->freerdp_session->PreConnect = frdp_pre_connect;
+   priv->freerdp_session->PostConnect = frdp_post_connect;
++  priv->freerdp_session->PostDisconnect = frdp_post_disconnect;
+   priv->freerdp_session->Authenticate = frdp_authenticate;
+   priv->freerdp_session->VerifyCertificate = frdp_certificate_verify;
+ #ifdef HAVE_FREERDP_1_1
+@@ -1121,6 +1260,22 @@ init_freerdp (VinagreRdpTab *rdp_tab)
+ #include <freerdp/version.h>
+ #if (FREERDP_VERSION_MAJOR == 1 && FREERDP_VERSION_MINOR >= 2 && FREERDP_VERSION_REVISION >= 1) || (FREERDP_VERSION_MAJOR == 2)
+   settings->UseRdpSecurityLayer = FALSE;
++  settings->RemoteFxCodec = TRUE;
++  settings->RedirectClipboard = FALSE;
++  settings->ColorDepth = 32;
++  settings->SupportGraphicsPipeline = TRUE;
++
++  build_options = g_ascii_strup (freerdp_get_build_config (), -1);
++  if (g_strrstr (build_options, "WITH_GFX_H264=ON") != NULL) {
++    settings->GfxH264 = TRUE;
++    settings->GfxAVC444 = TRUE;
++  } else {
++    settings->GfxH264 = FALSE;
++    settings->GfxAVC444 = FALSE;
++  }
++  g_free (build_options);
++
++  freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0);
+ #else
+   settings->DisableEncryption = FALSE;
+ #endif
+@@ -1268,7 +1423,7 @@ open_freerdp (VinagreRdpTab *rdp_tab)
+   else
+     {
+       priv->authentication_attempts = 0;
+-      priv->update_id = g_timeout_add (5, (GSourceFunc) update, rdp_tab);
++      priv->update_id = g_timeout_add (15, (GSourceFunc) update, rdp_tab);
+       result = TRUE;
+     }
+ 
+@@ -1289,6 +1444,8 @@ vinagre_rdp_tab_init (VinagreRdpTab *rdp
+   rdp_tab->priv = VINAGRE_RDP_TAB_GET_PRIVATE (rdp_tab);
+ 
+   rdp_tab->priv->connected_actions = create_connected_actions (rdp_tab);
++  g_mutex_init (&rdp_tab->priv->area_draw_mutex);
++  rdp_tab->priv->area_draw_queue = g_queue_new ();
+ 
+   g_signal_connect (rdp_tab, "realize", G_CALLBACK (tab_realized), NULL);
+ }
+--- vinagre-3.22.0/configure.ac
++++ vinagre-3.22.0/configure.ac
+@@ -59,7 +59,10 @@ AM_CONDITIONAL([VINAGRE_ENABLE_SSH], [te
+ 
+ # Whether to enable support for RDP.
+ RDP_DEPS="freerdp x11"
+-RDP_2_DEPS="freerdp2 >= 2.0.0 x11"
++RDP_2_DEPS="freerdp2 >= 2.0.0
++            freerdp-client2 >= 2.0.0
++            winpr2 >= 2.0.0
++            x11"
+ AC_ARG_ENABLE([rdp],
+   [AS_HELP_STRING([--disable-rdp],
+     [Disable Remote Desktop Protocol (RDP) support])])
